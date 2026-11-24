@@ -1,0 +1,937 @@
+#!/usr/bin/env python3
+"""docklet: a dock for river + rivermonad, in the family of spacelet,
+locklet, waymobar and bgmonad.
+
+  docklet            start the dock (it stays running)
+  docklet toggle     show it now, or hide it again (for a key)
+  docklet quit       stop it
+  docklet --help
+
+A tab that grows out of an edge of the screen with the applications that
+are running and, before them, the ones pinned to it. It is hidden: push
+the pointer against the edge and it slides out, and it goes away a moment
+after the pointer leaves it.
+
+  click          go to the application's window (again: its next window),
+                 or start it when it is not running
+  middle click   a new window of it
+  right click    a menu: its windows, new window, the actions of its
+                 desktop file, pin it to the dock or unpin it, close it
+  drag           an icon onto another one to reorder the pinned ones
+                 (dragging one that is not pinned pins it there)
+
+The windows come from rivermonad's IPC socket (rivermonad >= 0.4.3); the
+icons and names from the applications' desktop files.
+
+Settings: ~/.config/docklet/config.json (the pinned applications are kept
+there too); ~/.config/docklet/style.css is loaded after the built-in style
+(GTK CSS) to restyle it.
+
+Needs python-gobject, GTK 4, gtk4-layer-shell and rivermonad.
+"""
+import json
+import math
+import os
+import socket
+import sys
+import threading
+import time
+import warnings
+
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+# gtk4-layer-shell has to be loaded before libwayland-client (which gi pulls
+# in), or the windows come up as ordinary ones.
+from ctypes import CDLL  # noqa: E402
+
+try:
+    CDLL("libgtk4-layer-shell.so.0")
+except OSError:
+    CDLL("libgtk4-layer-shell.so")
+
+import gi  # noqa: E402
+
+gi.require_version("Gdk", "4.0")
+gi.require_version("Graphene", "1.0")
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gtk4LayerShell", "1.0")
+from gi.repository import Gdk, Gio, GLib, GObject, Graphene, Gtk, Pango  # noqa: E402
+from gi.repository import Gtk4LayerShell as Layer  # noqa: E402
+
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
+CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "docklet")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+
+DEFAULTS = {
+    "position": "left",     # left, right, bottom or top
+    "autohide": True,       # false: always there, and the windows make room for it
+    "icon_size": 40,        # logical pixels
+    "attached": True,       # it grows out of the edge, like waymobar's attached side panel;
+                            # false: a pill floating beside the edge, like the bar's
+    "margin": 6,            # floating: between the dock and the edge of the screen
+    "show_delay": 150,      # ms the pointer rests at the edge before it opens
+    "hide_delay": 400,      # ms after the pointer leaves it before it closes
+    "slide": 200,           # ms it takes to slide in; 0 = no animation
+    "corner_gap": 100,      # the edge does not open it this close to the corners
+    "pinned": [],           # desktop file IDs ("firefox.desktop"), in order
+}
+
+# Catppuccin Mocha, as in waymobar's pills: the dock is one more pill, its
+# menus and labels look like the bar's popovers.
+CSS = """
+window.docklet { background: none; }
+/* nearly nothing, but not nothing: a window that paints nothing at all
+   gets no pointer */
+window.docklet-edge { background: rgba(0, 0, 0, 0.01); }
+.docklet, .docklet label, .docklet-pop label {
+  font-family: "Inter", sans-serif; font-weight: 500; font-size: 10pt; color: #cdd6f4;
+}
+.docklet .dock { background-color: rgba(30, 30, 46, 0.90); border-radius: 18px; padding: 6px; }
+/* attached to the edge: the tab is drawn (its flares are no CSS box), in
+   the colours of the bar's popovers */
+@define-color docklet_tab_bg rgba(30, 30, 46, 0.97);
+@define-color docklet_tab_border #45475a;
+.docklet .tab .dock { background: none; border-radius: 0; }
+.docklet .item { border-radius: 12px; transition: background-color 120ms; }
+.docklet .item:hover, .docklet .item.menu-open { background-color: #313244; }
+.docklet .item.focused { background-color: rgba(203, 166, 247, 0.16); }
+.docklet .item.focused:hover { background-color: rgba(203, 166, 247, 0.26); }
+.docklet .item.drop { background-color: rgba(203, 166, 247, 0.34); }
+.docklet .item:drop(active) { box-shadow: none; }
+.docklet .item.launching image { animation: docklet-pulse 900ms ease-in-out infinite; }
+@keyframes docklet-pulse { 0% { opacity: 1; } 50% { opacity: 0.35; } 100% { opacity: 1; } }
+
+/* one dot per window (three at most); the focused application's are mauve,
+   and a single one grows into a bar */
+.docklet .dot {
+  min-width: 3px; min-height: 3px; border-radius: 2px; background-color: #a6adc8;
+  transition: min-height 150ms, min-width 150ms, background-color 150ms;
+}
+.docklet .item.focused .dot { background-color: #cba6f7; }
+.docklet .side .item.focused .dot:only-child { min-height: 14px; }
+.docklet .flat .item.focused .dot:only-child { min-width: 14px; }
+
+.docklet .dock separator { background-color: #45475a; min-width: 1px; min-height: 1px; }
+.docklet .side separator { margin: 3px 10px; }
+.docklet .flat separator { margin: 10px 3px; }
+
+popover.docklet-pop { background: none; }
+popover.docklet-pop > contents {
+  background-color: rgba(30, 30, 46, 0.97); color: #cdd6f4;
+  border: 1px solid #45475a; border-radius: 14px; box-shadow: none; padding: 5px;
+}
+popover.docklet-pop.tip > contents { padding: 6px 12px; border-radius: 12px; }
+popover.docklet-pop button.entry {
+  background: none; border: none; box-shadow: none; outline: none;
+  border-radius: 9px; padding: 6px 12px; min-height: 0;
+}
+popover.docklet-pop button.entry:hover { background-color: #313244; }
+popover.docklet-pop button.entry.current label { color: #cba6f7; }
+popover.docklet-pop button.entry.danger:hover label { color: #f38ba8; }
+popover.docklet-pop .heading { color: #6c7086; font-size: 8.5pt; padding: 4px 12px 2px 12px; }
+popover.docklet-pop separator { background-color: #45475a; min-height: 1px; margin: 4px 8px; }
+"""
+
+V, H = Gtk.Orientation.VERTICAL, Gtk.Orientation.HORIZONTAL
+
+# position: the edge, the way the icons run, how it slides in, where its
+# menus open and whether the gap to the edge comes first in the window
+EDGES = {
+    "left": (Layer.Edge.LEFT, V, Gtk.RevealerTransitionType.SLIDE_RIGHT, Gtk.PositionType.RIGHT, True),
+    "right": (Layer.Edge.RIGHT, V, Gtk.RevealerTransitionType.SLIDE_LEFT, Gtk.PositionType.LEFT, False),
+    "top": (Layer.Edge.TOP, H, Gtk.RevealerTransitionType.SLIDE_DOWN, Gtk.PositionType.BOTTOM, True),
+    "bottom": (Layer.Edge.BOTTOM, H, Gtk.RevealerTransitionType.SLIDE_UP, Gtk.PositionType.TOP, False),
+}
+
+
+def warn(msg):
+    print("docklet: " + msg, file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Settings
+
+class Settings:
+    """config.json: read once; docklet only ever rewrites its "pinned"."""
+
+    def __init__(self):
+        self.raw, self.broken = {}, False
+        try:
+            with open(CONFIG_FILE, encoding="utf-8") as f:
+                self.raw = json.load(f)
+            if not isinstance(self.raw, dict):
+                raise ValueError("it is not an object")
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError) as e:
+            # left alone: pins are not saved over a file that does not parse
+            warn("%s: %s" % (CONFIG_FILE, e))
+            self.raw, self.broken = {}, True
+
+    def get(self, key):
+        default = DEFAULTS[key]
+        value = self.raw.get(key, default)
+        if isinstance(default, bool):
+            ok = isinstance(value, bool)
+        elif isinstance(default, int):
+            ok = isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0
+            value = int(value) if ok else value
+        elif isinstance(default, list):
+            ok = isinstance(value, list) and all(isinstance(v, str) for v in value)
+        else:
+            ok = isinstance(value, str)
+        if key == "position" and value not in EDGES:
+            ok = False
+        if not ok:
+            warn('config.json: "%s": %r is not valid, using %r' % (key, value, default))
+            return default
+        return value
+
+    def save_pinned(self, pinned):
+        if self.broken:
+            warn("config.json does not parse: the pinned applications are not saved")
+            return
+        self.raw["pinned"] = list(pinned)
+        try:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            tmp = CONFIG_FILE + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.raw, f, indent=2, ensure_ascii=False)
+                f.write("\n")
+            os.replace(tmp, CONFIG_FILE)
+        except OSError as e:
+            warn("%s: %s" % (CONFIG_FILE, e))
+
+
+# ---------------------------------------------------------------------------
+# rivermonad
+
+def socket_path():
+    path = os.path.join(RUNTIME, "rivermonad-%s.sock" % os.environ.get("WAYLAND_DISPLAY", "wayland-0").replace("/", "_"))
+    if not os.path.exists(path):
+        path = os.environ.get("RIVERMONAD_SOCKET", "") or path
+    return path
+
+
+def action(a):
+    """Send an action to rivermonad, in the background."""
+    def send():
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.settimeout(2)
+                s.connect(socket_path())
+                s.sendall((json.dumps({"Action": a}) + "\n").encode())
+                s.recv(4096)
+        except OSError as e:
+            warn("rivermonad: %s" % e)
+    threading.Thread(target=send, daemon=True).start()
+
+
+def follow(on_state):
+    """Follow rivermonad's "EventStream" for ever, from a thread: on_state
+    gets every new state in the main loop, and None once rivermonad has
+    been gone for a few seconds (a restart takes about one)."""
+    failures = 0
+    while True:
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.connect(socket_path())
+                s.sendall(b'"EventStream"\n')
+                failures = 0
+                buf = b""
+                while True:
+                    chunk = s.recv(1 << 16)
+                    if not chunk:
+                        break
+                    *lines, buf = (buf + chunk).split(b"\n")
+                    state = None
+                    for line in lines:
+                        try:
+                            msg = json.loads(line)
+                        except ValueError:
+                            continue
+                        if isinstance(msg, dict) and isinstance(msg.get("State"), dict):
+                            state = msg["State"]
+                    if state is not None:   # only the newest of a burst
+                        GLib.idle_add(on_state, state)
+        except OSError:
+            pass
+        failures += 1
+        if failures == 10:
+            GLib.idle_add(on_state, None)
+        time.sleep(0.3)
+
+
+# ---------------------------------------------------------------------------
+# Applications
+
+# Exec= of many unrelated desktop files: says nothing about a window
+WRAPPERS = {"sh", "bash", "env", "python", "python3", "perl", "ruby", "java", "node",
+            "electron", "flatpak", "snap", "gtk-launch", "xdg-open", "steam", "wine"}
+
+
+class Apps:
+    """The installed applications, to find the one a window belongs to."""
+
+    def __init__(self, changed):
+        self.monitor = Gio.AppInfoMonitor.get()
+        self.monitor.connect("changed", lambda *_: (self.load(), changed()))
+        self.load()
+
+    def load(self):
+        self.by_id, self.by_class, self.by_tail, self.by_exec, self.cache = {}, {}, {}, {}, {}
+        # the ones a menu shows first: they win when two could match
+        for info in sorted(Gio.AppInfo.get_all(), key=lambda i: not i.should_show()):
+            name = (info.get_id() or "").removesuffix(".desktop").lower()
+            if not name:
+                continue
+            self.by_id.setdefault(name, info)
+            self.by_tail.setdefault(name.rsplit(".", 1)[-1], info)
+            wm = (info.get_startup_wm_class() or "").lower()
+            if wm:
+                self.by_class.setdefault(wm, info)
+            exe = os.path.basename(info.get_executable() or "").lower()
+            if exe and exe not in WRAPPERS:
+                self.by_exec.setdefault(exe, info)
+
+    def resolve(self, app_id):
+        """The application of a window with this app id, or None: the
+        desktop file of that name, the one with that StartupWMClass, the
+        one named like its last part (org.mozilla.firefox: firefox) or
+        ending in it (nautilus: org.gnome.Nautilus), the one that runs it."""
+        if app_id not in self.cache:
+            a = app_id.lower()
+            self.cache[app_id] = (self.by_id.get(a) or self.by_class.get(a)
+                                  or self.by_id.get(a.rsplit(".", 1)[-1])
+                                  or self.by_tail.get(a) or self.by_exec.get(a)) if a else None
+        return self.cache[app_id]
+
+    def by_key(self, key):
+        """The application pinned as key (a desktop file ID, or an app id)."""
+        name = key.removesuffix(".desktop")
+        return self.by_id.get(name.lower()) or self.resolve(name)
+
+
+class Entry:
+    """An icon of the dock: an application, its windows, whether it is pinned."""
+
+    def __init__(self, key, info, pinned):
+        self.key, self.info, self.pinned, self.wins = key, info, pinned, []
+        self.name = (info.get_display_name() or info.get_name()) if info else key.removesuffix(".desktop")
+
+    @property
+    def focused(self):
+        return any(w.get("focused") for w in self.wins)
+
+    def icon(self):
+        theme = Gtk.IconTheme.get_for_display(Gdk.Display.get_default())
+        icon = self.info.get_icon() if self.info else None
+        if icon is not None and (not isinstance(icon, Gio.ThemedIcon) or theme.has_gicon(icon)):
+            return icon
+        name = self.key.removesuffix(".desktop")
+        for n in (name, name.lower(), name.rsplit(".", 1)[-1].lower()):
+            if theme.has_icon(n):
+                return Gio.ThemedIcon.new(n)
+        return Gio.ThemedIcon.new("application-x-executable")
+
+
+# ---------------------------------------------------------------------------
+# The dock
+
+class Item(Gtk.Overlay):
+    """An application: its icon, and a dot per window at the screen's side."""
+
+    def __init__(self, view, entry):
+        super().__init__()
+        self.view, self.app, self.entry = view, view.app, entry
+        self.tip = self.menu = None
+        self.launch_timer = 0
+        self.add_css_class("item")
+        size = view.app.icon_size
+        pad = max(3, size // 10)
+        self.image = Gtk.Image(pixel_size=size, margin_top=pad, margin_bottom=pad,
+                               margin_start=pad, margin_end=pad)
+        self.set_child(self.image)
+        vertical = view.orientation == V
+        self.dots = Gtk.Box(orientation=view.orientation, spacing=2, can_target=False)
+        edge = view.edge
+        self.dots.set_halign(Gtk.Align.CENTER if not vertical
+                             else Gtk.Align.START if edge == Layer.Edge.LEFT else Gtk.Align.END)
+        self.dots.set_valign(Gtk.Align.CENTER if vertical
+                             else Gtk.Align.START if edge == Layer.Edge.TOP else Gtk.Align.END)
+        self.add_overlay(self.dots)
+        self.ndots = 0
+
+        click = Gtk.GestureClick(button=0)
+        click.connect("released", self.on_click)
+        self.add_controller(click)
+        motion = Gtk.EventControllerMotion()
+        motion.connect("enter", lambda *_: self.show_tip())
+        motion.connect("leave", lambda *_: self.hide_tip())
+        self.add_controller(motion)
+
+        drag = Gtk.DragSource(actions=Gdk.DragAction.MOVE)
+        drag.connect("prepare", lambda *_: Gdk.ContentProvider.new_for_value(GObject.Value(str, self.entry.key)))
+        drag.connect("drag-begin", self.on_drag_begin)
+        drag.connect("drag-end", self.on_drag_end)
+        drag.connect("drag-cancel", lambda *_: (self.on_drag_end(), False)[1])
+        self.add_controller(drag)
+        drop = Gtk.DropTarget.new(GObject.TYPE_STRING, Gdk.DragAction.MOVE)
+        drop.connect("enter", lambda *_: (self.add_css_class("drop"), Gdk.DragAction.MOVE)[1])
+        drop.connect("leave", lambda *_: self.remove_css_class("drop"))
+        drop.connect("drop", self.on_drop)
+        self.add_controller(drop)
+        self.update(entry)
+
+    def update(self, entry):
+        self.entry = entry
+        self.image.set_from_gicon(entry.icon())
+        n = min(len(entry.wins), 3)
+        while self.ndots < n:
+            dot = Gtk.Box()
+            dot.add_css_class("dot")
+            self.dots.append(dot)
+            self.ndots += 1
+        while self.ndots > n:
+            self.dots.remove(self.dots.get_last_child())
+            self.ndots -= 1
+        (self.add_css_class if entry.focused else self.remove_css_class)("focused")
+        if entry.wins:
+            self.set_launching(False)
+        if self.tip is not None:
+            self.tip.get_child().set_label(entry.name)
+
+    def set_launching(self, on):
+        """Pulse the icon until the application's window shows up."""
+        if self.launch_timer:
+            GLib.source_remove(self.launch_timer)
+            self.launch_timer = 0
+        if on:
+            self.add_css_class("launching")
+            self.launch_timer = GLib.timeout_add_seconds(8, lambda: self.set_launching(False))
+        else:
+            self.remove_css_class("launching")
+        return False
+
+    # -- the pointer
+
+    def on_click(self, gesture, n, x, y):
+        button = gesture.get_current_button()
+        if not self.contains(x, y):     # pressed here, released somewhere else
+            return
+        self.hide_tip()
+        if button == 1:
+            self.app.activate_entry(self.entry) and self.set_launching(True)
+        elif button == 2:
+            self.app.launch(self.entry) and self.set_launching(not self.entry.wins)
+        elif button == 3:
+            self.open_menu()
+
+    def popover(self, kind, **props):
+        pop = Gtk.Popover(has_arrow=False, position=self.view.pop_position, **props)
+        pop.add_css_class("docklet-pop")
+        pop.add_css_class(kind)
+        gap = self.app.dock_padding + 8     # past the pill's side, and a little more
+        pop.set_offset(*{Gtk.PositionType.RIGHT: (gap, 0), Gtk.PositionType.LEFT: (-gap, 0),
+                         Gtk.PositionType.BOTTOM: (0, gap), Gtk.PositionType.TOP: (0, -gap)}[self.view.pop_position])
+        pop.set_parent(self)
+        return pop
+
+    def show_tip(self):
+        """The application's name beside its icon, while the pointer is on it."""
+        if self.menu is not None or self.app.dragging or not self.view.revealer.get_child_revealed():
+            return
+        if self.tip is None:
+            self.tip = self.popover("tip", autohide=False)
+            self.tip.set_child(Gtk.Label(label=self.entry.name))
+        self.tip.popup()
+
+    def hide_tip(self):
+        if self.tip is not None:
+            self.tip.popdown()
+
+    def open_menu(self):
+        e, app = self.entry, self.app
+        box = Gtk.Box(orientation=V)
+
+        def row(label, run, *classes):
+            text = Gtk.Label(label=label, xalign=0, ellipsize=Pango.EllipsizeMode.END, max_width_chars=42)
+            b = Gtk.Button(child=text)
+            for c in ("entry",) + classes:
+                b.add_css_class(c)
+            b.connect("clicked", lambda *_: (self.menu.popdown(), run()))
+            box.append(b)
+
+        if e.wins:
+            for w in e.wins:
+                title = w.get("title") or e.name
+                if w.get("hidden"):
+                    title += "  (minimised)"
+                row(title, lambda w=w: action({"FocusWindow": {"id": w["id"]}}),
+                    *(("current",) if w.get("focused") else ()))
+            box.append(Gtk.Separator())
+        if e.info is not None:
+            row("New Window" if e.wins else "Open", lambda: app.launch(e) and self.set_launching(not e.wins))
+            for name in e.info.list_actions():
+                row(e.info.get_action_name(name) or name, lambda name=name: app.launch(e, name))
+            box.append(Gtk.Separator())
+        elif not e.wins:
+            row("Open", lambda: app.launch(e) and self.set_launching(True))
+            box.append(Gtk.Separator())
+        if e.pinned:
+            row("Unpin from Dock", lambda: app.unpin(e.key))
+        else:
+            row("Pin to Dock", lambda: app.pin(e.key))
+        if e.wins:
+            box.append(Gtk.Separator())
+            label = "Close" if len(e.wins) == 1 else "Close %d Windows" % len(e.wins)
+            row(label, lambda: [action({"CloseWindow": {"id": w["id"]}}) for w in e.wins], "danger")
+
+        self.menu = self.popover("menu", autohide=True)
+        self.menu.set_child(box)
+        self.menu.connect("closed", self.on_menu_closed)
+        self.add_css_class("menu-open")
+        self.view.menus += 1
+        self.menu.popup()
+
+    def on_menu_closed(self, pop):
+        self.remove_css_class("menu-open")
+        self.menu = None
+        self.view.menus -= 1
+        GLib.idle_add(pop.unparent)     # not while it is still handling the click
+        self.view.pointer_changed()
+
+    # -- reordering
+
+    def on_drag_begin(self, source, drag):
+        self.hide_tip()
+        self.app.dragging = True
+        source.set_icon(Gtk.WidgetPaintable.new(self.image), self.app.icon_size // 2, self.app.icon_size // 2)
+
+    def on_drag_end(self, *_):
+        self.app.dragging = False
+        for v in self.app.views:
+            v.pointer_changed()
+
+    def on_drop(self, target, key, x, y):
+        self.remove_css_class("drop")
+        if key != self.entry.key:
+            self.app.move(key, self.entry)
+        return True
+
+    def dispose(self):
+        self.set_launching(False)
+        for pop in (self.tip, self.menu):
+            if pop is not None:
+                pop.unparent()
+        self.tip = None
+
+
+TAB_FLARE = 14      # the radius of the curves where the tab leaves the edge
+TAB_RADIUS = 18     # and of its two corners away from it
+
+
+class Tab(Gtk.Box):
+    """The dock attached to the edge: a tab that grows out of the screen's
+    border, flaring out with inverted corners where it meets it (waymobar's
+    panelAttached, caelestia's bars). It leaves TAB_FLARE free at both ends
+    for the flares."""
+
+    def __init__(self, edge, orientation, child):
+        super().__init__(orientation=orientation)
+        self.edge = edge
+        self.add_css_class("tab")
+        if orientation == V:
+            child.set_margin_top(TAB_FLARE)
+            child.set_margin_bottom(TAB_FLARE)
+        else:
+            child.set_margin_start(TAB_FLARE)
+            child.set_margin_end(TAB_FLARE)
+        self.append(child)
+
+    def colour(self, name, fallback):
+        found, rgba = self.get_style_context().lookup_color(name)
+        if not found:
+            rgba = Gdk.RGBA()
+            rgba.parse(fallback)
+        return rgba.red, rgba.green, rgba.blue, rgba.alpha
+
+    def do_snapshot(self, snapshot):
+        w, h = self.get_width(), self.get_height()
+        cr = snapshot.append_cairo(Graphene.Rect().init(0, 0, w, h))
+        # drawn as if it were at the left edge (x: away from the edge, y:
+        # along it), and turned to the edge it is at
+        if self.edge == Layer.Edge.RIGHT:
+            cr.translate(w, 0)
+            cr.scale(-1, 1)
+        elif self.edge in (Layer.Edge.TOP, Layer.Edge.BOTTOM):
+            if self.edge == Layer.Edge.BOTTOM:
+                cr.translate(0, h)
+                cr.scale(1, -1)
+            cr.transform(type(cr.get_matrix())(0, 1, 1, 0, 0, 0))
+            w, h = h, w
+        f = min(TAB_FLARE, h / 4)
+        r = min(TAB_RADIUS, (h - 2 * f) / 2, w - f)
+        d = w - 0.5     # the border is a line inside it
+        cr.move_to(0, 0)
+        cr.arc_negative(f, 0, f, math.pi, math.pi / 2)
+        cr.arc(d - r, f + r, r, -math.pi / 2, 0)
+        cr.arc(d - r, h - f - r, r, 0, math.pi / 2)
+        cr.arc_negative(f, h, f, -math.pi / 2, -math.pi)
+        cr.set_source_rgba(*self.colour("docklet_tab_bg", "rgba(30,30,46,0.97)"))
+        cr.fill_preserve()
+        cr.set_source_rgba(*self.colour("docklet_tab_border", "#45475a"))
+        cr.set_line_width(1)
+        cr.stroke()     # not along the edge: the path is open there
+        Gtk.Box.do_snapshot(self, snapshot)
+
+
+class View:
+    """The dock on one monitor: its window, and the strip at the edge of
+    the screen that opens it."""
+
+    def __init__(self, app, monitor):
+        self.app, self.monitor = app, monitor
+        self.edge, self.orientation, slide, self.pop_position, gap_first = EDGES[app.position]
+        self.items, self.layout = {}, None
+        self.menus = 0                      # open menus: it stays while there is one
+        self.in_dock = self.in_strip = self.held = False
+        self.timer = 0
+        self.autohide = app.settings.get("autohide")
+
+        # not resizable: it always has the size of its icons, also with fewer
+        self.window = self.layer_window("docklet", resizable=False)
+        self.box = Gtk.Box(orientation=self.orientation, spacing=4)
+        self.box.add_css_class("dock")
+        attached = app.settings.get("attached")
+        self.revealer = Gtk.Revealer(transition_type=slide, transition_duration=app.settings.get("slide"),
+                                     child=Tab(self.edge, self.orientation, self.box) if attached else self.box,
+                                     reveal_child=not self.autohide)
+        self.revealer.connect("notify::child-revealed", self.on_revealed)
+        # floating: the gap to the edge belongs to the window, so the pointer
+        # does not leave the dock on its way from the edge to the icons
+        margin = 0 if attached else app.settings.get("margin")
+        gap = Gtk.Box()
+        gap.set_size_request(*((margin, -1) if self.orientation == V else (-1, margin)))
+        outer = Gtk.Box(orientation=H if self.orientation == V else V)
+        outer.add_css_class("side" if self.orientation == V else "flat")
+        for w in ((gap, self.revealer) if gap_first else (self.revealer, gap)):
+            outer.append(w)
+        self.window.set_child(outer)
+        self.watch(self.window, "in_dock")
+
+        self.strip = None
+        if self.autohide:
+            self.strip = self.layer_window("docklet-edge")
+            across = ((Layer.Edge.TOP, Layer.Edge.BOTTOM) if self.orientation == V
+                      else (Layer.Edge.LEFT, Layer.Edge.RIGHT))
+            for e in across:
+                Layer.set_anchor(self.strip, e, True)
+                Layer.set_margin(self.strip, e, app.settings.get("corner_gap"))
+            self.strip.set_child(Gtk.Box(width_request=1, height_request=1))
+            self.watch(self.strip, "in_strip")
+            self.strip.present()
+        else:
+            Layer.auto_exclusive_zone_enable(self.window)
+
+    def layer_window(self, name, **props):
+        w = Gtk.Window(application=self.app, decorated=False, **props)
+        w.add_css_class(name)
+        Layer.init_for_window(w)
+        Layer.set_namespace(w, name)
+        Layer.set_monitor(w, self.monitor)
+        Layer.set_layer(w, Layer.Layer.TOP)
+        Layer.set_anchor(w, self.edge, True)
+        Layer.set_keyboard_mode(w, Layer.KeyboardMode.NONE)
+        return w
+
+    def watch(self, window, flag):
+        motion = Gtk.EventControllerMotion()
+        motion.connect("enter", lambda *_: self.pointer_changed(**{flag: True}))
+        motion.connect("leave", lambda *_: self.pointer_changed(**{flag: False}))
+        window.add_controller(motion)
+
+    # -- the applications
+
+    def sync(self, pinned, running):
+        entries = pinned + running
+        for key in [k for k in self.items if k not in {e.key for e in entries}]:
+            item = self.items.pop(key)
+            item.dispose()
+        layout = [e.key for e in pinned] + ([None] if pinned and running else []) + [e.key for e in running]
+        for e in entries:
+            if e.key in self.items:
+                self.items[e.key].update(e)
+            else:
+                self.items[e.key] = Item(self, e)
+        if layout != self.layout:
+            self.layout = layout
+            while (child := self.box.get_first_child()) is not None:
+                self.box.remove(child)
+            for key in layout:
+                self.box.append(self.items[key] if key is not None else Gtk.Separator(
+                    orientation=H if self.orientation == V else V))
+        if not self.autohide:
+            self.window.set_visible(bool(entries))
+        elif not entries:
+            self.hide()
+
+    # -- showing and hiding
+
+    def pointer_changed(self, **flags):
+        """The pointer came to the strip or the dock, or left: open it after
+        a moment at the edge, close it a moment after it is gone."""
+        for k, v in flags.items():
+            setattr(self, k, v)
+        if not self.autohide:
+            return
+        if self.timer:
+            GLib.source_remove(self.timer)
+            self.timer = 0
+        shown = self.revealer.get_reveal_child() and self.window.get_visible()
+        if self.in_dock:
+            self.held = False       # shown by `docklet toggle`: from now on it follows the pointer
+            if not shown:
+                self.show()         # the pointer came back while it was sliding away
+        elif self.in_strip:
+            if not shown:
+                self.timer = GLib.timeout_add(self.app.settings.get("show_delay"), self.on_timer, self.show)
+        elif shown and not self.busy():
+            self.timer = GLib.timeout_add(self.app.settings.get("hide_delay"), self.on_timer, self.hide)
+
+    def busy(self):
+        return self.menus > 0 or self.app.dragging or self.held
+
+    def on_timer(self, what):
+        self.timer = 0
+        what()
+        return False
+
+    def show(self):
+        if not self.items:
+            return
+        self.window.present()
+        self.revealer.set_reveal_child(True)
+
+    def hide(self):
+        if not self.autohide:
+            return
+        self.held = False
+        for item in self.items.values():
+            item.hide_tip()
+        self.revealer.set_reveal_child(False)
+        if not self.revealer.get_child_revealed():
+            self.window.set_visible(False)
+
+    def on_revealed(self, *_):
+        # slid away: unmap the window, or it would keep taking the pointer
+        if self.autohide and not self.revealer.get_reveal_child() and not self.revealer.get_child_revealed():
+            self.window.set_visible(False)
+            self.in_dock = False
+
+    def toggle(self):
+        if not self.autohide:
+            return
+        if self.revealer.get_reveal_child() and self.window.get_visible():
+            self.hide()
+        else:
+            self.held = True
+            self.show()
+
+    def destroy(self):
+        if self.timer:
+            GLib.source_remove(self.timer)
+        for item in self.items.values():
+            item.dispose()
+        for w in (self.window, self.strip):
+            if w is not None:
+                w.destroy()
+
+
+class Docklet(Gtk.Application):
+
+    def __init__(self):
+        # one per Wayland display: a nested session has a dock of its own
+        display = "".join(c if c.isalnum() else "_" for c in os.environ.get("WAYLAND_DISPLAY", "wayland-0"))
+        super().__init__(application_id="dev.docklet.Docklet." + display,
+                         flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
+        self.views, self.windows, self.signature = [], [], None
+        self.order = []             # the running applications that are not pinned, as they came
+        self.last = {}              # key -> the window of it that had the focus last
+        self.focused_output = None
+        self.dragging = False
+        self.started = False
+
+    def do_startup(self):
+        Gtk.Application.do_startup(self)
+        self.settings = Settings()
+        self.position = self.settings.get("position")
+        self.icon_size = max(8, self.settings.get("icon_size"))
+        self.dock_padding = 6
+        self.pinned = list(dict.fromkeys(self.settings.get("pinned")))
+        display = Gdk.Display.get_default()
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CSS, -1) if Gtk.get_minor_version() >= 12 else provider.load_from_data(CSS.encode())
+        Gtk.StyleContext.add_provider_for_display(display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        user = os.path.join(CONFIG_DIR, "style.css")
+        if os.path.exists(user):
+            p = Gtk.CssProvider()
+            p.load_from_path(user)
+            Gtk.StyleContext.add_provider_for_display(display, p, Gtk.STYLE_PROVIDER_PRIORITY_USER)
+        self.apps = Apps(self.refresh)
+        self.hold()
+        self.monitors = display.get_monitors()
+        self.monitors.connect("items-changed", lambda *_: self.rebuild_views())
+        self.rebuild_views()
+        threading.Thread(target=follow, args=(self.on_state,), daemon=True).start()
+
+    def do_command_line(self, cl):
+        args = cl.get_arguments()[1:]
+        cmd = args[0] if args else None
+        if cmd == "quit":
+            self.quit()
+        elif cmd == "toggle":
+            # after the first state, when docklet was not running yet
+            GLib.timeout_add(0 if self.started else 400, self.toggle)
+        elif cmd is not None:
+            cl.printerr_literal("docklet: unknown command %s (see docklet --help)\n" % cmd)
+            return 2
+        elif self.started:
+            cl.printerr_literal("docklet: already running\n")
+        self.started = True
+        return 0
+
+    def rebuild_views(self):
+        for v in self.views:
+            v.destroy()
+        self.views = [View(self, self.monitors.get_item(i)) for i in range(self.monitors.get_n_items())]
+        self.refresh()
+
+    def toggle(self):
+        """On the focused output's dock (the others close)."""
+        mine = [v for v in self.views if v.monitor.get_connector() == self.focused_output] or self.views[:1]
+        for v in self.views:
+            v.toggle() if v in mine else v.hide()
+        return False
+
+    # -- the state
+
+    def on_state(self, state):
+        state = state or {}
+        self.focused_output = state.get("focused_output")
+        # scratchpads waiting out of sight are not applications to go to
+        wins = [w for w in state.get("windows", [])
+                if isinstance(w, dict) and w.get("id") and w.get("workspace") != "NSP"]
+        # the titles are for the menus only: a spinner in one redraws nothing
+        signature = [(w["id"], w.get("app_id"), w.get("focused"), w.get("hidden")) for w in wins]
+        self.windows = wins
+        if signature != self.signature:
+            self.signature = signature
+            self.refresh()
+        else:
+            for e in self.entries_by_key.values():
+                e.wins = [w for w in wins if self.key_of(w) == e.key]
+        return False
+
+    def key_of(self, win):
+        info = self.apps.resolve(win.get("app_id") or "")
+        return (info.get_id() if info else None) or win.get("app_id") or "unknown"
+
+    def refresh(self):
+        groups = {}
+        for w in self.windows:
+            key = self.key_of(w)
+            if key not in groups:
+                groups[key] = Entry(key, self.apps.resolve(w.get("app_id") or ""), key in self.pinned)
+            groups[key].wins.append(w)
+            if w.get("focused"):
+                self.last[key] = w["id"]
+        for key in self.pinned:
+            if key not in groups:
+                groups[key] = Entry(key, self.apps.by_key(key), True)
+        self.order = [k for k in self.order if k in groups and k not in self.pinned]
+        self.order += [k for k in groups if k not in self.pinned and k not in self.order]
+        self.entries_by_key = groups
+        pinned, running = [groups[k] for k in self.pinned], [groups[k] for k in self.order]
+        for v in self.views:
+            v.sync(pinned, running)
+
+    # -- what the icons do
+
+    def activate_entry(self, e):
+        """Go to the application: the window of it used last, the next one
+        when it has the focus already; start it when it has none. True when
+        it was started."""
+        if not e.wins:
+            return self.launch(e)
+        ids = [w["id"] for w in e.wins]
+        focused = next((w["id"] for w in e.wins if w.get("focused")), None)
+        if focused is None:
+            target = self.last.get(e.key) if self.last.get(e.key) in ids else ids[0]
+        elif len(ids) > 1:
+            target = ids[(ids.index(focused) + 1) % len(ids)]
+        else:
+            return False
+        action({"FocusWindow": {"id": target}})
+        return False
+
+    def launch(self, e, desktop_action=None):
+        """Start the application (or one of its desktop file's actions)."""
+        if e.info is None:
+            # no desktop file: the app id is usually the command
+            action({"Spawn": e.key})
+            return True
+        context = Gdk.Display.get_default().get_app_launch_context()
+        try:
+            if desktop_action:
+                e.info.launch_action(desktop_action, context)
+            else:
+                e.info.launch([], context)
+        except GLib.Error as err:
+            warn("%s: %s" % (e.key, err.message))
+            return False
+        return True
+
+    def pin(self, key, index=None):
+        if key in self.pinned:
+            self.pinned.remove(key)
+        self.pinned.insert(len(self.pinned) if index is None else index, key)
+        self.settings.save_pinned(self.pinned)
+        self.refresh()
+
+    def unpin(self, key):
+        if key in self.pinned:
+            self.pinned.remove(key)
+            self.settings.save_pinned(self.pinned)
+            self.refresh()
+
+    def move(self, key, onto):
+        """An icon was dropped on another: it takes that one's place among
+        the pinned ones, or the last when that one is not pinned."""
+        if key not in self.entries_by_key:
+            return
+        if onto.pinned:
+            old = self.pinned.index(key) if key in self.pinned else len(self.pinned)
+            new = self.pinned.index(onto.key)
+            # coming from before it, it lands after it: it took its place
+            self.pin(key, new if old > new else new)
+        else:
+            self.pin(key)
+
+
+def main():
+    args = sys.argv[1:]
+    if args and args[0] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    if len(args) > 1 or (args and args[0] not in ("toggle", "quit")):
+        print("docklet: unknown arguments (see docklet --help)", file=sys.stderr)
+        return 2
+    if not os.path.exists(socket_path()):
+        print("docklet: rivermonad is not running", file=sys.stderr)
+        return 1
+    return Docklet().run(sys.argv)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

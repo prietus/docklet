@@ -1,0 +1,15 @@
+{
+  "position": "left",
+  "autohide": true,
+  "attached": true,
+  "icon_size": 40,
+  "margin": 6,
+  "show_delay": 150,
+  "hide_delay": 400,
+  "slide": 200,
+  "corner_gap": 100,
+  "pinned": [
+    "firefox.desktop",
+    "foot.desktop"
+  ]
+}
