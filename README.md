@@ -6,6 +6,8 @@ are running and the ones you pinned, in a tab that grows out of an edge of
 the screen, like [waymobar](https://github.com/prietus/waymobar)'s attached
 side panel (or in a pill floating beside the edge, like the bar's).
 
+![docklet at the left edge of the screen](docs/screenshot.png)
+
 - it is **hidden**: push the pointer against the edge and it slides out,
   and it goes away a moment after the pointer leaves it (or it can stay
   there, and the windows make room for it);
