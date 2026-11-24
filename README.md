@@ -45,7 +45,8 @@ and, if you like, show it from the keyboard:
 
 ## Install
 
-Arch Linux: `packaging/arch/PKGBUILD`. By hand:
+Arch Linux: [docklet](https://aur.archlinux.org/packages/docklet) in the
+AUR (`packaging/arch/PKGBUILD`). By hand:
 
     pacman -S python-gobject gtk4 gtk4-layer-shell
     git clone https://github.com/prietus/docklet ~/docklet
