@@ -9,7 +9,7 @@ arch=('any')
 license=('BSD-3-Clause')
 depends=('python' 'python-gobject' 'gtk4' 'gtk4-layer-shell' 'rivermonad>=0.4.3')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('7a6803940bebb65eeb9fff702eb4d93ddbd7f4f1174c333f9d09fc8d09f98050')
 
 package() {
   cd $pkgname-$pkgver
